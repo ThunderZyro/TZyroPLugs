@@ -1,36 +1,46 @@
 # TZyroPLugs
 
-A collection of BetterDiscord plugins maintained by **ThunderZyro**.
+BetterDiscord plugins by **ThunderZyro**.
 
-## LocalMessageEditor
+## LocalMessageEditor — v1.1.0
 
-Adds a local-only edit button to other people's messages in the Discord hover action toolbar.
+Adds a local-only edit button to messages from other users.
 
-### Features
+### What it does
 
-- Adds a pencil button to messages sent by other users.
-- Lets you change the message text in your own Discord client.
-- Does not send edits to Discord or change the original message.
-- Includes a **Permanent message edits** setting:
-  - **On:** new local edits are saved on this device and survive Discord restarts.
-  - **Off:** new local edits are kept only for the current plugin session and are discarded when the plugin stops or Discord closes.
-- Includes a control to clear all local edits.
+- Adds a pencil button to the message action toolbar.
+- Opens an editor for another person's message.
+- Replaces the message text only in your local Discord view.
+- Keeps Discord's original message untouched; no edit is sent to Discord.
+- **Permanent message edits** setting:
+  - On: new edits are saved on this device across Discord restarts.
+  - Off: new edits are temporary and are discarded when the plugin stops or Discord closes.
+- Provides a control to clear all local edits.
 
-### Install
+### v1.1.0 compatibility update
 
-1. Download [LocalMessageEditor.plugin.js](./LocalMessageEditor.plugin.js).
-2. Open Discord's BetterDiscord plugins folder:
+- Uses Discord's current `MessageContent` rendering component for local text overrides.
+- Adds a `MessageButtons` toolbar integration for current Discord builds.
+- Retains a `MiniPopover` fallback for older Discord builds.
+- Avoids modifying Discord's message store.
+
+### Install / update
+
+1. Download the latest [LocalMessageEditor.plugin.js](https://raw.githubusercontent.com/ThunderZyro/TZyroPLugs/main/LocalMessageEditor.plugin.js).
+2. Open the BetterDiscord plugins folder:
    - Press `Win + R`.
    - Enter `%APPDATA%\BetterDiscord\plugins`.
-3. Put `LocalMessageEditor.plugin.js` in that folder.
-4. Restart Discord (or press `Ctrl + R`).
-5. Open **User Settings → BetterDiscord → Plugins** and enable **LocalMessageEditor**.
+3. Replace the old `LocalMessageEditor.plugin.js` with the downloaded file. Keep only one copy.
+4. In Discord, reload with `Ctrl + R`.
+5. Open **User Settings → BetterDiscord → Plugins** and enable LocalMessageEditor.
+
+### Troubleshooting
+
+If the button still does not appear, open Discord's Developer Tools with `Ctrl + Shift + I`, select **Console**, and look for messages beginning with `[LocalMessageEditor]`. Share the exact error text when reporting a problem.
 
 ### Important
 
-This plugin changes only your local presentation of messages. Other users continue to see the original message, and Discord's stored message is not edited. BetterDiscord and Discord updates may change internal UI components and require plugin compatibility updates.
-
-The plugin has not yet been verified against your live Discord client. If the button does not appear or Discord reports an error, capture the console error and open an issue in this repository.
+This is a client-side visual override. Other users always see the original message, and the plugin cannot change Discord's stored message. BetterDiscord and Discord updates can change internal components and may require future compatibility fixes.
 
 ## Repository
 
