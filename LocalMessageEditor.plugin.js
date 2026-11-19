@@ -1,8 +1,10 @@
 /**
  * @name LocalMessageEditor
- * @author OpenAI
- * @version 1.0.0
- * @description Locally edit other users' messages in your Discord client. Nothing is sent to Discord.
+ * @author ThunderZyro
+ * @version 1.1.0
+ * @description Adds local-only editing for other users' messages. Nothing is sent to Discord.
+ * @source https://github.com/ThunderZyro/TZyroPLugs
+ * @updateUrl https://raw.githubusercontent.com/ThunderZyro/TZyroPLugs/main/LocalMessageEditor.plugin.js
  */
 
 module.exports = class LocalMessageEditor {
@@ -17,6 +19,8 @@ module.exports = class LocalMessageEditor {
         this.unpatches = [];
         this.currentUserId = null;
         this.started = false;
+        this.messageContentFound = false;
+        this.toolbarFound = null;
     }
 
     getName() { return this.pluginName; }
@@ -139,62 +143,54 @@ module.exports = class LocalMessageEditor {
     }
 
     installMessageRendererPatch() {
-        // This is Discord's exported Message component. We clone only its input props;
-        // the original message object held by Discord's stores is never mutated.
-        let messageTarget = null;
-        let messageTargetKey = null;
+        const webpack = BdApi.Webpack;
 
-        // Recent Discord builds wrap the main message component in a memo object whose
-        // inner `type` function contains this stable diagnostic string. Prefer that
-        // target, then fall back to the older named default export.
-        try {
-            const memoMessage = BdApi.Webpack.getBySource(
-                "Message must not be a thread starter message",
-                {
-                    declarationFilter: declaration =>
-                        typeof declaration?.type === "function" &&
-                        String(declaration.type).includes("Message must not be a thread starter message")
-                }
-            );
-            if (memoMessage?.type) {
-                messageTarget = memoMessage;
-                messageTargetKey = "type";
-            }
-        } catch (_) { /* Try the display-name fallback below. */ }
+        // Current Discord renders message text through this memoized component.
+        // MessageLoggerV2 uses the same SEND_FAILED / SENDING source markers.
+        const findMessageContent = () => webpack.getModule(module => {
+            const target = module?.default?.type ? module.default : module;
+            const source = String(target?.type || "");
+            return typeof target?.type === "function" &&
+                source.includes("SEND_FAILED") &&
+                source.includes("SENDING");
+        }, { searchExports: true }) || webpack.getModule(module => {
+            const target = module?.default?.type ? module.default : module;
+            const source = String(target?.type || "");
+            return typeof target?.type === "function" &&
+                source.includes("SEND_FAILED") &&
+                source.includes("SENDING");
+        });
 
-        if (!messageTarget) {
-            const messageModule = BdApi.Webpack.getModule(module => module?.default?.displayName === "Message");
-            if (messageModule?.default) {
-                messageTarget = messageModule;
-                messageTargetKey = "default";
-            }
+        const found = findMessageContent();
+        const contentTarget = found?.default?.type ? found.default : found;
+        if (!contentTarget?.type || typeof contentTarget.type !== "function") {
+            throw new Error("Could not find Discord's MessageContent renderer (SEND_FAILED/SENDING markers).");
         }
 
-        if (!messageTarget || !messageTargetKey) {
-            throw new Error("Discord's Message component was not found.");
-        }
-
-        this.addPatch(BdApi.Patcher.before(this.pluginName, messageTarget, messageTargetKey, (_thisObject, args) => {
+        // Change only the props passed to Discord's renderer. Never mutate the
+        // message object stored by Discord or send an update to Discord's servers.
+        this.addPatch(BdApi.Patcher.before(this.pluginName, contentTarget, "type", (_thisObject, args) => {
             const props = args?.[0];
-            const originalMessage = props?.message;
-            const key = this.keyFor(originalMessage);
+            const message = props?.message;
+            const key = this.keyFor(message);
             const localContent = this.getLocalEdit(key);
             if (localContent === undefined) return;
 
-            const localMessage = {
-                ...originalMessage,
-                content: localContent,
-                // Hide the server edited timestamp in this local presentation.
-                // This is a display-only clone; Discord's original data is unchanged.
-                editedTimestamp: null,
-                edited_timestamp: null
+            args[0] = {
+                ...props,
+                message: {
+                    ...message,
+                    content: localContent,
+                    editedTimestamp: null,
+                    edited_timestamp: null
+                }
             };
-            args[0] = { ...props, message: localMessage };
         }));
 
-        // Each rendered message subscribes to a tiny local refresh channel so an edit
-        // appears immediately without dispatching fake Discord events or touching stores.
-        this.addPatch(BdApi.Patcher.after(this.pluginName, messageTarget, messageTargetKey, (_thisObject, args, result) => {
+        // Register a React refresh callback so a saved local override appears
+        // immediately. This follows the same render-hook pattern used by the
+        // current MessageLoggerV2 implementation for MessageContent.
+        this.addPatch(BdApi.Patcher.after(this.pluginName, contentTarget, "type", (_thisObject, args, result) => {
             const props = args?.[0] || {};
             const key = this.keyFor(props.message);
             const React = BdApi.React;
@@ -202,11 +198,13 @@ module.exports = class LocalMessageEditor {
 
             React.useEffect(() => {
                 if (!key) return undefined;
+
                 let listeners = this.renderListeners.get(key);
                 if (!listeners) {
                     listeners = new Set();
                     this.renderListeners.set(key, listeners);
                 }
+
                 const listener = () => forceUpdate(value => value + 1);
                 listeners.add(listener);
 
@@ -220,6 +218,9 @@ module.exports = class LocalMessageEditor {
 
             return result;
         }));
+
+        this.messageContentFound = true;
+        this.api.Logger.info("MessageContent renderer found and patched.");
     }
 
     findMessageProps(value, seen = new Set(), depth = 0) {
@@ -257,45 +258,203 @@ module.exports = class LocalMessageEditor {
     }
 
     installToolbarPatch() {
-        // MiniPopover is the compact action toolbar used for message hover actions.
-        const miniPopoverModule = BdApi.Webpack.getModule(module => module?.default?.displayName === "MiniPopover");
-        const MiniPopover = miniPopoverModule?.default;
-        if (!miniPopoverModule || !MiniPopover?.Button) {
-            throw new Error("Discord's message hover toolbar (MiniPopover) was not found.");
-        }
+        const React = BdApi.React;
+        const webpack = BdApi.Webpack;
 
-        this.addPatch(BdApi.Patcher.after(this.pluginName, miniPopoverModule, "default", (_thisObject, args, result) => {
-            try {
-                if (!result?.props) return result;
-                const messageProps = this.findMessageProps(args);
-                const message = messageProps?.message;
-                if (!message?.id || !message?.author?.id) return result;
+        const isClickableElement = node =>
+            React.isValidElement(node) &&
+            typeof node.type === "string" &&
+            typeof node.props?.onClick === "function" &&
+            typeof node.props?.className === "string";
+
+        const findClickable = (node, seen = new Set(), depth = 0) => {
+            if (depth > 8 || node == null) return null;
+            if (Array.isArray(node)) {
+                for (const child of node) {
+                    const found = findClickable(child, seen, depth + 1);
+                    if (found) return found;
+                }
+                return null;
+            }
+            if (!React.isValidElement(node) || seen.has(node)) return null;
+            seen.add(node);
+            if (isClickableElement(node)) return node;
+            return findClickable(node.props?.children, seen, depth + 1);
+        };
+
+        const containsClickable = node => !!findClickable(node);
+
+        const findActionArray = (node, seen = new Set(), depth = 0) => {
+            if (depth > 8 || node == null) return null;
+            if (Array.isArray(node)) {
+                if (node.some(containsClickable)) return node;
+                for (const child of node) {
+                    const found = findActionArray(child, seen, depth + 1);
+                    if (found) return found;
+                }
+                return null;
+            }
+            if (!React.isValidElement(node) || seen.has(node)) return null;
+            seen.add(node);
+            return findActionArray(node.props?.children, seen, depth + 1);
+        };
+
+        const makePencil = () => React.createElement("svg", {
+            width: 20,
+            height: 20,
+            viewBox: "0 0 24 24",
+            fill: "none",
+            "aria-hidden": "true"
+        }, React.createElement("path", {
+            d: "M3.5 17.25V20.5h3.25L18.9 8.35l-3.25-3.25L3.5 17.25Zm17.25-10.6a.86.86 0 0 0 0-1.22l-2.03-2.03a.86.86 0 0 0-1.22 0l-1.59 1.59 3.25 3.25 1.59-1.59Z",
+            fill: "currentColor"
+        }));
+
+        const buildButton = (sample, message) => {
+            const click = event => {
+                event?.preventDefault?.();
+                event?.stopPropagation?.();
+                this.openEditor(message);
+            };
+
+            if (sample) {
+                let replaced = false;
+                const replaceSvg = node => {
+                    if (Array.isArray(node)) return node.map(replaceSvg);
+                    if (!React.isValidElement(node)) return node;
+                    if (node.type === "svg") {
+                        replaced = true;
+                        return makePencil();
+                    }
+                    if (node.props?.children == null) return node;
+                    return React.cloneElement(node, {}, replaceSvg(node.props.children));
+                };
+
+                const children = replaceSvg(sample.props.children);
+                return React.cloneElement(sample, {
+                    key: "local-message-editor-button",
+                    onClick: click,
+                    onKeyDown: undefined,
+                    title: "Edit message locally",
+                    "aria-label": "Edit message locally",
+                    children: replaced ? children : makePencil()
+                });
+            }
+
+            return React.createElement("button", {
+                key: "local-message-editor-button",
+                type: "button",
+                title: "Edit message locally",
+                "aria-label": "Edit message locally",
+                onClick: click,
+                style: {
+                    border: 0,
+                    background: "transparent",
+                    color: "var(--interactive-normal)",
+                    cursor: "pointer",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    padding: "4px"
+                }
+            }, makePencil());
+        };
+
+        const patchMessageButtons = messageButtons => {
+            if (!messageButtons?.type || typeof messageButtons.type !== "function") return false;
+
+            this.addPatch(BdApi.Patcher.after(this.pluginName, messageButtons, "type", (_thisObject, args, result) => {
+                const message = args?.[0]?.message;
+                if (!message?.id || !message?.author?.id || !result?.props) return result;
+
                 const currentUserId = this.getCurrentUserId();
                 if (currentUserId && message.author.id === currentUserId) return result;
 
-                const React = BdApi.React;
-                const children = result.props.children;
-                const childArray = Array.isArray(children) ? children : (children == null ? [] : [children]);
-                if (childArray.some(child => child?.key === "local-message-editor-button")) return result;
+                const actionArray = findActionArray(result.props.children);
+                if (!actionArray || actionArray.some(child => child?.key === "local-message-editor-button")) return result;
 
-                const button = React.createElement(MiniPopover.Button, {
-                    key: "local-message-editor-button",
-                    onClick: event => {
-                        event?.stopPropagation?.();
-                        this.openEditor(message);
-                    },
-                    "aria-label": "Edit message locally",
-                    title: "Edit message locally"
-                }, this.makeEditIcon(React));
+                const sample = findClickable(actionArray);
+                actionArray.unshift(buildButton(sample, message));
+                return result;
+            }));
 
-                // Place it with the normal message actions, beside Reply / Forward.
-                childArray.splice(Math.min(2, childArray.length), 0, button);
-                result.props.children = childArray;
+            this.toolbarFound = "MessageButtons";
+            this.api.Logger.info("Current MessageButtons component patched.");
+            return true;
+        };
+
+        // Current Discord's message action row is exposed as MessageButtons.
+        // These source markers are also used by maintained BetterDiscord addon maps.
+        let messageButtons = null;
+        try {
+            messageButtons = webpack.getBySource(".innerClassName", {
+                declarationFilter: declaration =>
+                    String(declaration?.type).includes(".innerClassName") &&
+                    String(declaration?.type).includes("SEND_FAILED")
+            });
+        } catch (error) {
+            this.api.Logger.warn("MessageButtons declaration lookup failed.", error);
+        }
+
+        if (!messageButtons?.type) {
+            try {
+                messageButtons = webpack.getModule(module => {
+                    const target = module?.default?.type ? module.default : module;
+                    const source = String(target?.type || "");
+                    return typeof target?.type === "function" &&
+                        source.includes(".innerClassName") &&
+                        source.includes("SEND_FAILED");
+                }, { searchExports: true });
+                if (messageButtons?.default?.type) messageButtons = messageButtons.default;
             } catch (error) {
-                this.api?.Logger?.warn("Could not add the local edit button to a message", error);
+                this.api.Logger.warn("MessageButtons export lookup failed.", error);
             }
-            return result;
-        }));
+        }
+
+        if (patchMessageButtons(messageButtons)) return;
+
+        // Compatibility fallback for Discord builds that still use MiniPopover.
+        const miniPopoverModule = webpack.getModule(module =>
+            module?.default?.displayName === "MiniPopover"
+        );
+        const MiniPopover = miniPopoverModule?.default;
+
+        if (miniPopoverModule && MiniPopover?.Button) {
+            this.addPatch(BdApi.Patcher.after(this.pluginName, miniPopoverModule, "default", (_thisObject, args, result) => {
+                try {
+                    const messageProps = this.findMessageProps(args);
+                    const message = messageProps?.message;
+                    if (!message?.id || !message?.author?.id || !result?.props) return result;
+
+                    const currentUserId = this.getCurrentUserId();
+                    if (currentUserId && message.author.id === currentUserId) return result;
+
+                    const children = result.props.children;
+                    const childArray = Array.isArray(children) ? children.slice() : (children == null ? [] : [children]);
+                    if (childArray.some(child => child?.key === "local-message-editor-button")) return result;
+
+                    childArray.unshift(React.createElement(MiniPopover.Button, {
+                        key: "local-message-editor-button",
+                        onClick: event => {
+                            event?.stopPropagation?.();
+                            this.openEditor(message);
+                        },
+                        "aria-label": "Edit message locally",
+                        title: "Edit message locally"
+                    }, makePencil()));
+
+                    result.props.children = childArray;
+                } catch (error) {
+                    this.api.Logger.warn("Could not add the local edit button.", error);
+                }
+                return result;
+            }));
+            this.toolbarFound = "MiniPopover (compatibility)";
+            this.api.Logger.info("Legacy MiniPopover toolbar patched.");
+            return;
+        }
+
+        throw new Error("Could not locate Discord's MessageButtons or MiniPopover hover toolbar.");
     }
 
     openEditor(message) {
